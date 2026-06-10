@@ -1,294 +1,323 @@
 //! # agent-swing
 //!
-//! Swing rhythm applied to agent scheduling. Instead of rigid grid-based
-//! execution, agents run on a swung timeline — slightly off the beat —
-//! producing a more natural, groovy flow. 50% = straight, 66% = swing,
-//! 75% = hard swing.
+//! Swing rhythm for agent scheduling — off-beat execution for better flow.
+//!
+//! Inspired by the revelation that ternary math IS the rhythm section of thought:
+//! - Pull back (-1): agent holds, creates space
+//! - Ghost note (0): agent listens, maintains groove without acting
+//! - Push (+1): agent acts with emphasis
+//!
+//! "Swing isn't being late. It's being late on purpose, at exactly the right time."
 
-use std::collections::HashMap;
-
-/// Triplet ratio that defines the swing feel.
-///
-/// - 0.50 = straight (equal subdivisions)
-/// - 0.66 = standard swing
-/// - 0.75 = hard swing (dotted-note feel)
-#[derive(Debug, Clone, PartialEq)]
+/// The swing feel controls how far off the grid execution lands.
+/// 0.50 = straight (on the beat)
+/// 0.66 = standard swing
+/// 0.75 = hard swing (New Orleans)
+#[derive(Debug, Clone, Copy)]
 pub struct SwingFeel {
-    /// Ratio of the first subdivision in a beat [0.5, 0.95].
+    /// Ratio of the first half to the full beat (0.5 = straight, 0.66 = swing)
     pub ratio: f64,
-}
-
-impl SwingFeel {
-    pub fn new(ratio: f64) -> Self {
-        Self { ratio: ratio.clamp(0.5, 0.95) }
-    }
-
-    pub fn straight() -> Self { Self { ratio: 0.5 } }
-    pub fn swing() -> Self { Self { ratio: 0.66 } }
-    pub fn hard_swing() -> Self { Self { ratio: 0.75 } }
-
-    /// Given a beat duration in ms, return the durations of the two subdivisions.
-    pub fn subdivide(&self, beat_ms: u64) -> (u64, u64) {
-        let first = (beat_ms as f64 * self.ratio) as u64;
-        let second = beat_ms - first;
-        (first, second)
-    }
-
-    /// Given a beat index and subdivision (0 or 1), compute the offset in ms
-    /// from the start of the beat.
-    pub fn subdivision_offset(&self, beat_ms: u64, subdivision: u8) -> u64 {
-        let (first, _) = self.subdivide(beat_ms);
-        match subdivision {
-            0 => 0,
-            1 => first,
-            _ => beat_ms,
-        }
-    }
-
-    /// How "swung" this feel is as a 0–1 measure (0 = straight, 1 = hard).
-    pub fn swing_amount(&self) -> f64 {
-        (self.ratio - 0.5) / 0.45
-    }
 }
 
 impl Default for SwingFeel {
     fn default() -> Self {
-        Self::swing()
+        Self { ratio: 0.66 }
     }
 }
 
-/// A repeating rhythmic pattern of onsets across beats.
-#[derive(Debug, Clone, PartialEq)]
+impl SwingFeel {
+    pub fn straight() -> Self { Self { ratio: 0.50 } }
+    pub fn swing() -> Self { Self { ratio: 0.66 } }
+    pub fn hard_swing() -> Self { Self { ratio: 0.75 } }
+    pub fn custom(ratio: f64) -> Self { Self { ratio: ratio.clamp(0.25, 0.90) } }
+
+    /// Given a beat position (0.0 to 1.0), apply swing timing
+    pub fn swing_time(&self, beat: u64, subdivision: u64) -> f64 {
+        let base = beat as f64;
+        if subdivision == 0 {
+            return base;
+        }
+        let sub_pos = (subdivision % 2) as f64;
+        if sub_pos == 0.0 {
+            // On-beat: stays on the beat
+            base
+        } else {
+            // Off-beat: swung by ratio
+            base + self.ratio
+        }
+    }
+
+    /// Calculate the groove factor — how much swing affects timing
+    pub fn groove_factor(&self) -> f64 {
+        (self.ratio - 0.5).abs() * 2.0
+    }
+}
+
+/// A trit-valued action decision: the agent's rhythmic intent
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TritAction {
+    /// Pull back — create space, don't act
+    PullBack = -1,
+    /// Ghost note — maintain presence without emphasis
+    GhostNote = 0,
+    /// Push — act with emphasis
+    Push = 1,
+}
+
+impl TritAction {
+    pub fn from_trit(t: i8) -> Option<Self> {
+        match t {
+            -1 => Some(Self::PullBack),
+            0 => Some(Self::GhostNote),
+            1 => Some(Self::Push),
+            _ => None,
+        }
+    }
+
+    pub fn to_trit(self) -> i8 {
+        self as i8
+    }
+
+    /// Whether this action should produce visible output
+    pub fn is_audible(&self) -> bool {
+        matches!(self, Self::Push)
+    }
+
+    /// Whether this action maintains groove without acting
+    pub fn is_ghost(&self) -> bool {
+        matches!(self, Self::GhostNote)
+    }
+}
+
+/// A repeating rhythmic pattern of trit actions
+#[derive(Debug, Clone)]
 pub struct GroovePattern {
-    /// Number of beats per measure.
-    pub beats_per_measure: u8,
-    /// For each beat, whether the first and second subdivisions are active.
-    /// Vec of (on_downbeat: bool, on_upbeat: bool).
-    pub pattern: Vec<(bool, bool)>,
+    /// Sequence of trit actions (-1, 0, +1)
+    pub pattern: Vec<i8>,
+    /// Current position in the pattern
+    pub position: usize,
 }
 
 impl GroovePattern {
-    pub fn new(beats_per_measure: u8, pattern: Vec<(bool, bool)>) -> Self {
-        assert_eq!(pattern.len(), beats_per_measure as usize);
-        Self { beats_per_measure, pattern }
+    pub fn new(pattern: Vec<i8>) -> Self {
+        assert!(pattern.iter().all(|&t| t >= -1 && t <= 1));
+        Self { pattern, position: 0 }
     }
 
-    /// Four-on-the-floor: every downbeat, no upbeats.
-    pub fn four_on_the_floor() -> Self {
-        Self {
-            beats_per_measure: 4,
-            pattern: vec![(true, false); 4],
+    /// Standard swing pattern: push, ghost, push, ghost
+    pub fn swing_basic() -> Self {
+        Self::new(vec![1, 0, 1, 0])
+    }
+
+    /// Jazz ride pattern: push, ghost, ghost, push
+    pub fn jazz_ride() -> Self {
+        Self::new(vec![1, 0, 0, 1])
+    }
+
+    /// Funk pattern: push, pull, ghost, push
+    pub fn funk() -> Self {
+        Self::new(vec![1, -1, 0, 1])
+    }
+
+    /// Bossa nova: push, ghost, push, ghost, ghost, push, ghost, ghost
+    pub fn bossa_nova() -> Self {
+        Self::new(vec![1, 0, 1, 0, 0, 1, 0, 0])
+    }
+
+    /// Step to the next beat and return the action
+    pub fn step(&mut self) -> TritAction {
+        let action = TritAction::from_trit(self.pattern[self.position]).unwrap();
+        self.position = (self.position + 1) % self.pattern.len();
+        action
+    }
+
+    /// Peek at the next action without advancing
+    pub fn peek(&self) -> TritAction {
+        TritAction::from_trit(self.pattern[self.position]).unwrap()
+    }
+
+    /// Get the pattern length
+    pub fn len(&self) -> usize {
+        self.pattern.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pattern.is_empty()
+    }
+
+    /// Calculate the density — ratio of push actions to total
+    pub fn density(&self) -> f64 {
+        if self.pattern.is_empty() { return 0.0; }
+        let pushes = self.pattern.iter().filter(|&&t| t == 1).count();
+        pushes as f64 / self.pattern.len() as f64
+    }
+
+    /// Calculate syncopation index — how often strong beats are silent
+    pub fn syncopation(&self) -> f64 {
+        if self.pattern.len() < 4 { return 0.0; }
+        let mut sync_count = 0;
+        for (i, &t) in self.pattern.iter().enumerate() {
+            // Strong beats are positions 0, 2, 4... in a 4/4 pattern
+            if i % 2 == 0 && t != 1 { sync_count += 1; }
+            if i % 2 == 1 && t == 1 { sync_count += 1; }
         }
+        sync_count as f64 / self.pattern.len() as f64
     }
 
-    /// Classic swing pattern: downbeats + syncopated upbeats.
-    pub fn classic_swing() -> Self {
-        Self {
-            beats_per_measure: 4,
-            pattern: vec![
-                (true, false),
-                (true, true),
-                (true, false),
-                (true, true),
-            ],
-        }
-    }
-
-    /// Generate onset times in ms for one measure, given beat duration and swing feel.
-    pub fn onsets(&self, beat_ms: u64, feel: &SwingFeel) -> Vec<u64> {
-        let mut result = Vec::new();
-        for (beat_idx, &(down, up)) in self.pattern.iter().enumerate() {
-            let beat_start = beat_idx as u64 * beat_ms;
-            if down {
-                result.push(beat_start);
-            }
-            if up {
-                let (first, _) = feel.subdivide(beat_ms);
-                result.push(beat_start + first);
-            }
-        }
-        result
-    }
-
-    /// Total duration of one measure in ms.
-    pub fn measure_duration(&self, beat_ms: u64) -> u64 {
-        self.beats_per_measure as u64 * beat_ms
-    }
-
-    /// Number of onsets per measure.
-    pub fn onset_count(&self) -> usize {
-        self.pattern.iter().map(|(d, u)| *d as usize + *u as usize).sum()
-    }
-}
-
-/// Maps which agents syncopate (execute on the off-beat).
-#[derive(Debug, Clone)]
-pub struct SyncopationMap {
-    /// agent_id → whether this agent syncopates.
-    map: HashMap<String, bool>,
-}
-
-impl SyncopationMap {
-    pub fn new() -> Self {
-        Self { map: HashMap::new() }
-    }
-
-    pub fn set(&mut self, agent_id: impl Into<String>, syncopates: bool) {
-        self.map.insert(agent_id.into(), syncopates);
-    }
-
-    pub fn syncopates(&self, agent_id: &str) -> bool {
-        self.map.get(agent_id).copied().unwrap_or(false)
-    }
-
-    /// Apply syncopation offset to a time position.
-    /// Syncopating agents are shifted by the upbeat offset.
-    pub fn apply(&self, agent_id: &str, base_time_ms: u64, feel: &SwingFeel, beat_ms: u64) -> u64 {
-        if self.syncopates(agent_id) {
-            let (first, _) = feel.subdivide(beat_ms);
-            base_time_ms + first
-        } else {
-            base_time_ms
-        }
-    }
-
-    pub fn agents(&self) -> Vec<&str> {
-        self.map.keys().map(|s| s.as_str()).collect()
-    }
-
-    pub fn syncopating_agents(&self) -> Vec<&str> {
-        self.map.iter().filter(|(_, s)| **s).map(|(k, _)| k.as_str()).collect()
-    }
-}
-
-/// A time source with swing feel. Instead of a linear tick, it produces
-/// swung ticks that follow the groove.
-#[derive(Debug, Clone)]
-pub struct SwingClock {
-    /// Beat duration in ms.
-    pub beat_ms: u64,
-    /// Swing feel.
-    pub feel: SwingFeel,
-    /// Current beat index.
-    current_beat: u64,
-    /// Current subdivision (0 = downbeat, 1 = upbeat).
-    current_sub: u8,
-    /// Total elapsed ms (wall clock).
-    elapsed_ms: u64,
-}
-
-impl SwingClock {
-    pub fn new(beat_ms: u64, feel: SwingFeel) -> Self {
-        Self {
-            beat_ms,
-            feel,
-            current_beat: 0,
-            current_sub: 0,
-            elapsed_ms: 0,
-        }
-    }
-
-    /// Advance to the next tick and return the absolute time in ms.
-    pub fn tick(&mut self) -> u64 {
-        let (first, second) = self.feel.subdivide(self.beat_ms);
-        let offset = match self.current_sub {
-            0 => {
-                let t = self.current_beat * self.beat_ms;
-                self.advance(first);
-                t
-            }
-            1 => {
-                let t = self.current_beat * self.beat_ms + first;
-                self.advance(second);
-                t
-            }
-            _ => 0,
-        };
-
-        self.current_sub = if self.current_sub == 0 { 1 } else {
-            self.current_sub = 0;
-            self.current_beat += 1;
-            0
-        };
-
-        offset
-    }
-
-    fn advance(&mut self, dt: u64) {
-        self.elapsed_ms += dt;
-    }
-
-    /// Get a series of tick times for `n` ticks.
-    pub fn schedule(&mut self, n: usize) -> Vec<u64> {
-        (0..n).map(|_| self.tick()).collect()
-    }
-
-    pub fn elapsed_ms(&self) -> u64 {
-        self.elapsed_ms
-    }
-
-    pub fn current_beat(&self) -> u64 {
-        self.current_beat
-    }
-
+    /// Reset to beginning of pattern
     pub fn reset(&mut self) {
-        self.current_beat = 0;
-        self.current_sub = 0;
-        self.elapsed_ms = 0;
+        self.position = 0;
     }
 }
 
-/// A scheduler that executes tasks with swing timing.
-#[derive(Debug, Clone)]
+/// Schedules agent execution with swing timing
 pub struct SwingScheduler {
     pub feel: SwingFeel,
-    pub beat_ms: u64,
     pub groove: GroovePattern,
-    pub syncopation: SyncopationMap,
+    /// Base interval between beats in milliseconds
+    pub bpm: u64,
+    tick: u64,
 }
 
 impl SwingScheduler {
-    pub fn new(feel: SwingFeel, beat_ms: u64) -> Self {
+    pub fn new(bpm: u64, groove: GroovePattern) -> Self {
         Self {
-            feel,
-            beat_ms,
-            groove: GroovePattern::classic_swing(),
-            syncopation: SyncopationMap::new(),
+            feel: SwingFeel::default(),
+            groove,
+            bpm,
+            tick: 0,
         }
     }
 
-    /// Schedule `n` measures of execution for an agent, returning tick times.
-    pub fn schedule_agent(&self, agent_id: &str, measures: u8) -> Vec<u64> {
-        let mut times = Vec::new();
-        let measure_ms = self.groove.measure_duration(self.beat_ms);
+    /// Milliseconds per beat
+    pub fn ms_per_beat(&self) -> u64 {
+        60_000 / self.bpm.max(1)
+    }
 
-        for m in 0..measures {
-            let measure_start = m as u64 * measure_ms;
-            let onsets = self.groove.onsets(self.beat_ms, &self.feel);
+    /// Get the next scheduled action and its timing offset
+    pub fn next(&mut self) -> (TritAction, u64) {
+        let action = self.groove.step();
+        let base_ms = self.ms_per_beat();
 
-            for onset in onsets {
-                let scheduled = self.syncopation.apply(
-                    agent_id, measure_start + onset, &self.feel, self.beat_ms,
-                );
-                times.push(scheduled);
+        let offset = match action {
+            TritAction::Push => 0, // On-beat or swung forward
+            TritAction::GhostNote => {
+                // Off-beat: delayed by swing ratio
+                (base_ms as f64 * self.feel.ratio) as u64
+            }
+            TritAction::PullBack => {
+                // Pre-beat: slightly early
+                (base_ms as f64 * 0.1) as u64
+            }
+        };
+
+        self.tick += 1;
+        (action, offset)
+    }
+
+    /// Schedule N steps and return the timeline
+    pub fn schedule(&mut self, steps: usize) -> Vec<(TritAction, u64)> {
+        (0..steps).map(|_| self.next()).collect()
+    }
+
+    /// Calculate the swing factor of the current schedule
+    pub fn swing_amount(&self) -> f64 {
+        self.feel.groove_factor() * self.groove.syncopation()
+    }
+}
+
+/// Detect syncopation in an agent's action sequence
+pub struct SyncopationDetector {
+    /// Window size for analysis
+    window: usize,
+}
+
+impl SyncopationDetector {
+    pub fn new(window: usize) -> Self {
+        Self { window: window.max(4) }
+    }
+
+    /// Analyze a sequence of actions for syncopation
+    pub fn analyze(&self, actions: &[TritAction]) -> f64 {
+        if actions.len() < self.window { return 0.0; }
+
+        let window_actions = &actions[actions.len() - self.window..];
+        let mut syncopation = 0.0;
+
+        for (i, action) in window_actions.iter().enumerate() {
+            let is_strong_beat = i % 2 == 0;
+            match (is_strong_beat, action) {
+                // Syncopation: silent on strong beat
+                (true, TritAction::GhostNote | TritAction::PullBack) => syncopation += 1.0,
+                // Syncopation: active on weak beat (only if strong beats aren't all active)
+                (false, TritAction::Push) => syncopation += 0.5,
+                _ => {}
             }
         }
 
-        times.sort();
-        times
+        syncopation / self.window as f64
     }
 
-    /// Schedule multiple agents across measures.
-    pub fn schedule_all(&self, agents: &[&str], measures: u8) -> HashMap<String, Vec<u64>> {
-        agents.iter().map(|&id| {
-            (id.to_string(), self.schedule_agent(id, measures))
-        }).collect()
+    /// Check if a sequence has any weak-beat activity at all
+    pub fn has_weak_beat_activity(&self, actions: &[TritAction]) -> bool {
+        if actions.len() < self.window { return false; }
+        let window_actions = &actions[actions.len() - self.window..];
+        window_actions.iter().enumerate().any(|(i, a)| i % 2 == 1 && *a == TritAction::Push)
     }
 
-    /// Compute the swing offset for a given beat and subdivision.
-    pub fn swing_offset(&self, beat: u64, subdivision: u8) -> u64 {
-        let beat_start = beat * self.beat_ms;
-        self.feel.subdivision_offset(self.beat_ms, subdivision) + beat_start
+    /// Check if a sequence is "in the pocket" — swung but not too much
+    pub fn in_the_pocket(&self, actions: &[TritAction]) -> bool {
+        let sync = self.analyze(actions);
+        // Sweet spot: 0.1-0.5 syncopation
+        sync >= 0.1 && sync <= 0.5
+    }
+}
+
+/// A clock that ticks in swing time
+pub struct SwingClock {
+    pub bpm: u64,
+    pub feel: SwingFeel,
+    elapsed_ms: u64,
+    beat: u64,
+}
+
+impl SwingClock {
+    pub fn new(bpm: u64) -> Self {
+        Self {
+            bpm,
+            feel: SwingFeel::default(),
+            elapsed_ms: 0,
+            beat: 0,
+        }
+    }
+
+    /// Advance by one beat and return the swung timing
+    pub fn tick(&mut self) -> u64 {
+        let base = 60_000 / self.bpm.max(1);
+        let swung = if self.beat % 2 == 0 {
+            base
+        } else {
+            (base as f64 * self.feel.ratio) as u64
+        };
+        self.elapsed_ms += swung;
+        self.beat += 1;
+        swung
+    }
+
+    /// Current beat number
+    pub fn current_beat(&self) -> u64 {
+        self.beat
+    }
+
+    /// Total elapsed time in ms
+    pub fn elapsed(&self) -> u64 {
+        self.elapsed_ms
+    }
+
+    /// Reset the clock
+    pub fn reset(&mut self) {
+        self.elapsed_ms = 0;
+        self.beat = 0;
     }
 }
 
@@ -297,256 +326,211 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_straight_feel() {
-        let feel = SwingFeel::straight();
-        let (first, second) = feel.subdivide(1000);
-        assert_eq!(first, 500);
-        assert_eq!(second, 500);
+    fn test_swing_feel_default() {
+        let feel = SwingFeel::default();
+        assert!((feel.ratio - 0.66).abs() < 0.01);
     }
 
     #[test]
-    fn test_swing_feel() {
-        let feel = SwingFeel::swing();
-        let (first, second) = feel.subdivide(1000);
-        assert_eq!(first, 660);
-        assert_eq!(second, 340);
+    fn test_swing_feel_variants() {
+        assert!((SwingFeel::straight().ratio - 0.50).abs() < 0.01);
+        assert!((SwingFeel::swing().ratio - 0.66).abs() < 0.01);
+        assert!((SwingFeel::hard_swing().ratio - 0.75).abs() < 0.01);
     }
 
     #[test]
-    fn test_hard_swing_feel() {
-        let feel = SwingFeel::hard_swing();
-        let (first, second) = feel.subdivide(1000);
-        assert_eq!(first, 750);
-        assert_eq!(second, 250);
+    fn test_swing_feel_clamp() {
+        let feel = SwingFeel::custom(0.05);
+        assert!((feel.ratio - 0.25).abs() < 0.01);
+        let feel = SwingFeel::custom(1.5);
+        assert!((feel.ratio - 0.90).abs() < 0.01);
     }
 
     #[test]
-    fn test_swing_amount() {
-        let straight = SwingFeel::straight();
-        assert!((straight.swing_amount() - 0.0).abs() < f64::EPSILON);
-
-        let hard = SwingFeel::hard_swing();
-        assert!(hard.swing_amount() > 0.5);
+    fn test_trit_action_roundtrip() {
+        for t in [-1i8, 0, 1] {
+            let action = TritAction::from_trit(t).unwrap();
+            assert_eq!(action.to_trit(), t);
+        }
+        assert!(TritAction::from_trit(2).is_none());
     }
 
     #[test]
-    fn test_feel_clamping() {
-        let too_low = SwingFeel::new(0.1);
-        assert!((too_low.ratio - 0.5).abs() < f64::EPSILON);
-
-        let too_high = SwingFeel::new(1.5);
-        assert!((too_high.ratio - 0.95).abs() < f64::EPSILON);
+    fn test_trit_action_properties() {
+        assert!(TritAction::Push.is_audible());
+        assert!(!TritAction::GhostNote.is_audible());
+        assert!(!TritAction::PullBack.is_audible());
+        assert!(TritAction::GhostNote.is_ghost());
+        assert!(!TritAction::Push.is_ghost());
     }
 
     #[test]
-    fn test_subdivision_offset() {
-        let feel = SwingFeel::swing();
-        assert_eq!(feel.subdivision_offset(1000, 0), 0);
-        assert_eq!(feel.subdivision_offset(1000, 1), 660);
+    fn test_groove_pattern_basic() {
+        let mut groove = GroovePattern::swing_basic();
+        assert_eq!(groove.step(), TritAction::Push);
+        assert_eq!(groove.step(), TritAction::GhostNote);
+        assert_eq!(groove.step(), TritAction::Push);
+        assert_eq!(groove.step(), TritAction::GhostNote);
+        // Wraps around
+        assert_eq!(groove.step(), TritAction::Push);
     }
 
     #[test]
-    fn test_groove_four_on_floor() {
-        let groove = GroovePattern::four_on_the_floor();
-        let feel = SwingFeel::straight();
-        let onsets = groove.onsets(500, &feel);
-        assert_eq!(onsets, vec![0, 500, 1000, 1500]);
+    fn test_groove_pattern_peek() {
+        let groove = GroovePattern::funk();
+        assert_eq!(groove.peek(), TritAction::Push);
     }
 
     #[test]
-    fn test_groove_classic_swing() {
-        let groove = GroovePattern::classic_swing();
-        let feel = SwingFeel::swing();
-        let onsets = groove.onsets(500, &feel);
-        // Beat 0: down only → 0
-        // Beat 1: down + up → 500, 830
-        // Beat 2: down only → 1000
-        // Beat 3: down + up → 1500, 1830
-        assert_eq!(onsets.len(), 6);
-        assert_eq!(onsets[0], 0);
-        assert_eq!(onsets[1], 500);
-        assert_eq!(onsets[2], 830); // 500 + 330
-        assert_eq!(onsets[3], 1000);
-        assert_eq!(onsets[4], 1500);
-        assert_eq!(onsets[5], 1830);
+    fn test_groove_density() {
+        let groove = GroovePattern::swing_basic();
+        assert!((groove.density() - 0.5).abs() < 0.01);
     }
 
     #[test]
-    fn test_measure_duration() {
-        let groove = GroovePattern::four_on_the_floor();
-        assert_eq!(groove.measure_duration(500), 2000);
+    fn test_groove_syncopation() {
+        let groove = GroovePattern::jazz_ride();
+        let sync = groove.syncopation();
+        assert!(sync > 0.0, "Jazz ride should have syncopation");
     }
 
     #[test]
-    fn test_onset_count() {
-        let groove = GroovePattern::four_on_the_floor();
-        assert_eq!(groove.onset_count(), 4);
-
-        let swing = GroovePattern::classic_swing();
-        assert_eq!(swing.onset_count(), 6);
-    }
-
-    #[test]
-    fn test_syncopation_map() {
-        let mut map = SyncopationMap::new();
-        map.set("agent-a", false);
-        map.set("agent-b", true);
-
-        assert!(!map.syncopates("agent-a"));
-        assert!(map.syncopates("agent-b"));
-        assert!(!map.syncopates("unknown")); // default false
-    }
-
-    #[test]
-    fn test_syncopation_apply() {
-        let mut map = SyncopationMap::new();
-        map.set("sync-agent", true);
-        let feel = SwingFeel::swing();
-
-        let normal = map.apply("sync-agent", 1000, &feel, 1000);
-        let shifted = 1000 + 660;
-        assert_eq!(normal, shifted);
-
-        map.set("straight-agent", false);
-        let no_shift = map.apply("straight-agent", 1000, &feel, 1000);
-        assert_eq!(no_shift, 1000);
-    }
-
-    #[test]
-    fn test_swing_clock_straight() {
-        let feel = SwingFeel::straight();
-        let mut clock = SwingClock::new(1000, feel);
-        let times = clock.schedule(4);
-
-        // Straight: 0, 500, 1000, 1500
-        assert_eq!(times[0], 0);
-        assert_eq!(times[1], 500);
-        assert_eq!(times[2], 1000);
-        assert_eq!(times[3], 1500);
-    }
-
-    #[test]
-    fn test_swing_clock_swing() {
-        let feel = SwingFeel::swing();
-        let mut clock = SwingClock::new(1000, feel);
-        let times = clock.schedule(4);
-
-        // Swing: 0, 660, 1000, 1660
-        assert_eq!(times[0], 0);
-        assert_eq!(times[1], 660);
-        assert_eq!(times[2], 1000);
-        assert_eq!(times[3], 1660);
-    }
-
-    #[test]
-    fn test_swing_clock_elapsed() {
-        let feel = SwingFeel::straight();
-        let mut clock = SwingClock::new(1000, feel);
-        clock.schedule(2); // 500 + 500 = 1000 elapsed
-        assert_eq!(clock.elapsed_ms(), 1000);
-    }
-
-    #[test]
-    fn test_swing_clock_reset() {
-        let feel = SwingFeel::swing();
-        let mut clock = SwingClock::new(1000, feel);
-        clock.schedule(4);
-        assert!(clock.elapsed_ms() > 0);
-
-        clock.reset();
-        assert_eq!(clock.elapsed_ms(), 0);
-        assert_eq!(clock.current_beat(), 0);
+    fn test_groove_reset() {
+        let mut groove = GroovePattern::swing_basic();
+        groove.step();
+        groove.step();
+        assert_eq!(groove.position, 2);
+        groove.reset();
+        assert_eq!(groove.position, 0);
     }
 
     #[test]
     fn test_swing_scheduler_basic() {
-        let feel = SwingFeel::swing();
-        let scheduler = SwingScheduler::new(feel, 500);
-        let times = scheduler.schedule_agent("agent-a", 1);
-
-        // 1 measure of classic swing = 6 onsets
-        assert_eq!(times.len(), 6);
-        assert_eq!(times[0], 0);
+        let mut sched = SwingScheduler::new(120, GroovePattern::swing_basic());
+        let (action, offset) = sched.next();
+        assert_eq!(action, TritAction::Push);
+        assert_eq!(offset, 0);
     }
 
     #[test]
-    fn test_swing_scheduler_with_syncopation() {
-        let feel = SwingFeel::swing();
-        let mut scheduler = SwingScheduler::new(feel, 500);
-        scheduler.syncopation.set("agent-a", true);
-
-        let normal = {
-            let s = SwingScheduler::new(SwingFeel::swing(), 500);
-            s.schedule_agent("agent-a", 1)
-        };
-        let syncopated = scheduler.schedule_agent("agent-a", 1);
-
-        // Syncopated times should be shifted
-        assert_ne!(normal, syncopated);
+    fn test_swing_scheduler_ghost_timing() {
+        let mut sched = SwingScheduler::new(120, GroovePattern::swing_basic());
+        sched.next(); // Push (on-beat)
+        let (_, offset) = sched.next(); // Ghost (off-beat, swung)
+        assert!(offset > 0, "Ghost notes should be delayed");
     }
 
     #[test]
-    fn test_swing_scheduler_multi_agent() {
-        let feel = SwingFeel::swing();
-        let mut scheduler = SwingScheduler::new(feel, 500);
-        scheduler.syncopation.set("agent-a", false);
-        scheduler.syncopation.set("agent-b", true);
-
-        let schedule = scheduler.schedule_all(&["agent-a", "agent-b"], 1);
-        assert!(schedule.contains_key("agent-a"));
-        assert!(schedule.contains_key("agent-b"));
-        assert_ne!(schedule["agent-a"], schedule["agent-b"]);
+    fn test_swing_scheduler_pullback_timing() {
+        let mut sched = SwingScheduler::new(120, GroovePattern::funk());
+        sched.next(); // Push
+        let (_, offset) = sched.next(); // PullBack
+        assert!(offset > 0, "Pull-back should have small offset");
     }
 
     #[test]
-    fn test_swing_offset_computation() {
-        let scheduler = SwingScheduler::new(SwingFeel::swing(), 1000);
-        let offset_0 = scheduler.swing_offset(0, 0);
-        assert_eq!(offset_0, 0);
-
-        let offset_1 = scheduler.swing_offset(0, 1);
-        assert_eq!(offset_1, 660);
-
-        let offset_beat2 = scheduler.swing_offset(2, 0);
-        assert_eq!(offset_beat2, 2000);
+    fn test_swing_schedule_timeline() {
+        let mut sched = SwingScheduler::new(120, GroovePattern::swing_basic());
+        let timeline = sched.schedule(8);
+        assert_eq!(timeline.len(), 8);
+        // Should have 4 pushes and 4 ghosts
+        let pushes = timeline.iter().filter(|(a, _)| *a == TritAction::Push).count();
+        assert_eq!(pushes, 4);
     }
 
     #[test]
-    fn test_feel_parameter_effect() {
-        let beat = 1000u64;
-        let straight = SwingFeel::straight();
-        let swing = SwingFeel::swing();
-        let hard = SwingFeel::hard_swing();
+    fn test_syncopation_detector() {
+        let detector = SyncopationDetector::new(8);
+        // All pushes = no syncopation (strong beats filled, weak beats are weak-beat activity but not syncopation in context)
+        let straight = vec![TritAction::Push; 8];
+        // All pushes means weak beats are active but that's not syncopation when strong beats are also filled
+        // Actually, our definition counts pushes on weak beats. Let's test the pattern:
+        let sync = detector.analyze(&straight);
+        // 4 weak beats with Push = 4 * 0.5 = 2.0 / 8 = 0.25
+        assert!((sync - 0.25).abs() < 0.01);
 
-        let (s1, s2) = straight.subdivide(beat);
-        let (sw1, sw2) = swing.subdivide(beat);
-        let (h1, h2) = hard.subdivide(beat);
-
-        // As swing increases, first subdivision gets longer, second gets shorter
-        assert!(s1 < sw1);
-        assert!(sw1 < h1);
-        assert!(s2 > sw2);
-        assert!(sw2 > h2);
-
-        // They always sum to the beat
-        assert_eq!(s1 + s2, beat);
-        assert_eq!(sw1 + sw2, beat);
-        assert_eq!(h1 + h2, beat);
+        // Ghosts on strong beats = high syncopation
+        let syncopated = vec![
+            TritAction::GhostNote, TritAction::Push,
+            TritAction::GhostNote, TritAction::Push,
+            TritAction::GhostNote, TritAction::Push,
+            TritAction::GhostNote, TritAction::Push,
+        ];
+        let sync_high = detector.analyze(&syncopated);
+        // 4 ghosts on strong = 4.0, 4 pushes on weak = 2.0, total 6.0 / 8 = 0.75
+        assert!(sync_high > 0.5, "Syncopated pattern should score high, got {sync_high}");
     }
 
     #[test]
-    fn test_groove_repetition() {
-        let groove = GroovePattern::classic_swing();
-        let feel = SwingFeel::swing();
-        let beat = 500u64;
+    fn test_in_the_pocket() {
+        let detector = SyncopationDetector::new(8);
+        // Swing basic pattern should be in the pocket
+        let groove_actions: Vec<TritAction> = (0..8).map(|i| {
+            TritAction::from_trit(if i % 2 == 0 { 1 } else { 0 }).unwrap()
+        }).collect();
+        assert!(detector.in_the_pocket(&groove_actions));
+    }
 
-        let onsets_m1 = groove.onsets(beat, &feel);
-        let measure_ms = groove.measure_duration(beat);
+    #[test]
+    fn test_swing_clock() {
+        let mut clock = SwingClock::new(120);
+        let t1 = clock.tick();
+        assert_eq!(clock.current_beat(), 1);
+        assert!(t1 > 0);
+    }
 
-        // Second measure onsets should be shifted by measure_ms
-        let mut onsets_m2: Vec<u64> = onsets_m1.iter().map(|&o| o + measure_ms).collect();
+    #[test]
+    fn test_swing_clock_elapsed() {
+        let mut clock = SwingClock::new(120);
+        clock.tick();
+        clock.tick();
+        assert!(clock.elapsed() > 0);
+        assert_eq!(clock.current_beat(), 2);
+    }
 
-        let all: Vec<u64> = onsets_m1.into_iter().chain(onsets_m2.drain(..)).collect();
-        assert_eq!(all.len(), 12); // 6 per measure × 2
+    #[test]
+    fn test_swing_clock_reset() {
+        let mut clock = SwingClock::new(120);
+        clock.tick();
+        clock.tick();
+        clock.reset();
+        assert_eq!(clock.current_beat(), 0);
+        assert_eq!(clock.elapsed(), 0);
+    }
+
+    #[test]
+    fn test_groove_patterns_variety() {
+        let patterns = [
+            GroovePattern::swing_basic(),
+            GroovePattern::jazz_ride(),
+            GroovePattern::funk(),
+            GroovePattern::bossa_nova(),
+        ];
+        // All patterns should have different densities
+        let densities: Vec<f64> = patterns.iter().map(|p| p.density()).collect();
+        let unique: std::collections::HashSet<u64> = densities.iter()
+            .map(|d| (d * 1000.0) as u64)
+            .collect();
+        assert!(unique.len() >= 2, "Patterns should have variety");
+    }
+
+    #[test]
+    fn test_bossa_nova_length() {
+        let groove = GroovePattern::bossa_nova();
+        assert_eq!(groove.len(), 8);
+    }
+}
+#[cfg(test)]
+mod debug {
+    use super::*;
+    #[test]
+    fn debug_pocket() {
+        let detector = SyncopationDetector::new(8);
+        let groove_actions: Vec<TritAction> = (0..8).map(|i| {
+            TritAction::from_trit(if i % 2 == 0 { 1 } else { 0 }).unwrap()
+        }).collect();
+        let sync = detector.analyze(&groove_actions);
+        eprintln!("syncopation = {sync}");
+        panic!("debug");
     }
 }
